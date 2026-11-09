@@ -22,6 +22,30 @@ export async function PATCH(req: NextRequest) {
 
     if (error) return NextResponse.json({ error: error.message }, { status: 400 });
 
+    if (status !== 'WORKING') {
+      await supabase
+        .from('allocations')
+        .delete()
+        .match({ employee_id, date });
+    } else {
+      // If status restored to WORKING, restore primary allocations
+      const { data: prims } = await supabase
+        .from('assignments')
+        .select('process_id')
+        .eq('employee_id', employee_id)
+        .eq('role', 'PRIMARY');
+
+      if (prims && prims.length > 0) {
+        const rows = prims.map((p) => ({
+          employee_id,
+          process_id: p.process_id,
+          date,
+          approved: true,
+        }));
+        await supabase.from('allocations').upsert(rows, { onConflict: 'employee_id,process_id,date' });
+      }
+    }
+
     // Revalidate
     const month = date.substring(0, 7);
     const input = await loadEngineInput(month);

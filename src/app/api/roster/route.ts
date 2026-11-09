@@ -16,7 +16,7 @@ export async function GET(req: NextRequest) {
   const id = searchParams.get('id');
 
   // Load entries + allocations for the month
-  const [entriesRes, allocationsRes, employeesRes, processesRes, brandsRes, assignmentsRes] =
+  const [entriesRes, allocationsRes, employeesRes, processesRes, brandsRes, assignmentsRes, holidaysRes] =
     await Promise.all([
       supabase.from('roster_entries').select('*').gte('date', startDate).lte('date', endDate),
       supabase.from('allocations').select('*').gte('date', startDate).lte('date', endDate),
@@ -24,6 +24,7 @@ export async function GET(req: NextRequest) {
       supabase.from('processes').select('*, brands(id, name)').order('name'),
       supabase.from('brands').select('*').order('name'),
       supabase.from('assignments').select('*'),
+      supabase.from('holidays').select('*'),
     ]);
 
   if (entriesRes.error) return NextResponse.json({ error: entriesRes.error.message }, { status: 500 });
@@ -34,6 +35,7 @@ export async function GET(req: NextRequest) {
   const processes = processesRes.data ?? [];
   const brands = brandsRes.data ?? [];
   const assignments = assignmentsRes.data ?? [];
+  const holidays = holidaysRes.data ?? [];
 
   // Filter by view
   if (view === 'pod' && id) {
@@ -62,6 +64,6 @@ export async function GET(req: NextRequest) {
     entries = entries.filter((e: any) => e.employee_id === id);
   }
 
-  return NextResponse.json({ employees, entries, allocations, processes, brands, assignments });
+  return NextResponse.json({ employees, entries, allocations, processes, brands, assignments, holidays });
 }
 

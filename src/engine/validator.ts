@@ -15,7 +15,7 @@ import type {
   Conflict,
   Brand,
 } from './types';
-import { isProcessRequired, getMinStaff, getMonthDates } from './calendar';
+import { isProcessRequired, getMinStaff, getMonthDates, getWeeksInMonth } from './calendar';
 
 /**
  * Validate the full roster state and return all conflicts.
@@ -64,6 +64,41 @@ export function validateRoster(
     }
   }
 
+  // ── NO_VALID_WEEKLY_OFF checks (ensures consistency even during standalone validation) ──
+  const weeks = getWeeksInMonth(allDates);
+  for (const emp of employees) {
+    const empPrimaries = assignments.filter((a) => a.employeeId === emp.id && a.role === 'PRIMARY');
+    if (empPrimaries.length === 0) continue;
+
+    for (let wIdx = 0; wIdx < weeks.length; wIdx++) {
+      const weekDates = weeks[wIdx];
+      if (weekDates.length < 7) continue;
+
+      const hasRestDay = weekDates.some((d) => {
+        const entry = entries.find((e) => e.employeeId === emp.id && e.date === d);
+        return entry && entry.status !== 'WORKING';
+      });
+
+      if (!hasRestDay) {
+        const firstProc = processes.find((p) => p.id === empPrimaries[0].processId);
+        const alreadyFlagged = conflicts.some(
+          (c) => c.code === 'NO_VALID_WEEKLY_OFF' && c.employeeId === emp.id
+        );
+        if (!alreadyFlagged) {
+          conflicts.push({
+            code: 'NO_VALID_WEEKLY_OFF',
+            severity: 'error',
+            date: weekDates[0],
+            employeeId: emp.id,
+            processId: firstProc?.id,
+            brandId: firstProc?.brandId,
+            message: `No valid weekly off found for ${emp.name} in week ${wIdx + 1} (${weekDates[0]} to ${weekDates[weekDates.length - 1]}). All candidate days leave processes uncovered.`,
+          });
+        }
+      }
+    }
+  }
+
   // ── Per-date checks ─────────────────────────────────────
   for (const date of allDates) {
     // ── COVERAGE checks (NO_COVERAGE, UNDERSTAFFED) ───────
@@ -78,7 +113,14 @@ export function validateRoster(
           a.approved === true,
       ).length;
 
-      if (approvedCount === 0) {
+      const pendingCount = allocations.filter(
+        (a) =>
+          a.processId === proc.id &&
+          a.date === date &&
+          a.approved === false,
+      ).length;
+
+      if (approvedCount === 0 && pendingCount === 0) {
         const brand = brands.find((b) => b.id === proc.brandId);
         conflicts.push({
           code: 'NO_COVERAGE',
@@ -88,7 +130,7 @@ export function validateRoster(
           brandId: proc.brandId,
           message: `No approved coverage for "${proc.name}" (${brand?.name ?? proc.brandId}) on ${date}. Need ${needed} staff.`,
         });
-      } else if (approvedCount < needed) {
+      } else if (approvedCount < needed && pendingCount === 0) {
         const brand = brands.find((b) => b.id === proc.brandId);
         conflicts.push({
           code: 'UNDERSTAFFED',
@@ -123,7 +165,7 @@ export function validateRoster(
     // ── OVERLOAD ──────────────────────────────────────────
     for (const emp of employees) {
       const empAllocations = allocations.filter(
-        (a) => a.employeeId === emp.id && a.date === date,
+        (a) => a.employeeId === emp.id && a.date === date && a.approved === true,
       );
       if (empAllocations.length === 0) continue;
 

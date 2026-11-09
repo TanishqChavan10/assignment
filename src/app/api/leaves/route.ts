@@ -25,6 +25,18 @@ export async function POST(req: NextRequest) {
     .select()
     .single();
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+
+  // Sync to roster_entries and allocations if this month has been generated
+  await supabase
+    .from('roster_entries')
+    .update({ status: body.type ?? 'LEAVE' })
+    .match({ employee_id: body.employee_id, date: body.date });
+
+  await supabase
+    .from('allocations')
+    .delete()
+    .match({ employee_id: body.employee_id, date: body.date });
+
   return NextResponse.json(data, { status: 201 });
 }
 

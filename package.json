@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "next lint",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "reset-demo": "node scripts/reset-demo.js",
+    "verify-data": "node scripts/verify-queries.js"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

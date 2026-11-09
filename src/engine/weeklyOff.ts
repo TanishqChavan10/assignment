@@ -176,7 +176,7 @@ export function generateWeeklyOffs(
         if (weekPlacements.get(emp.id) === date) continue;
 
         // Check: if this employee is off on this date, does every PRIMARY
-        // process of theirs still meet minStaff?
+        // process of theirs still meet minStaff (via other primaries or backup)?
         let viable = true;
         for (const assignment of empPrimaryAssignments) {
           const proc = processes.find((p) => p.id === assignment.processId)!;
@@ -190,8 +190,23 @@ export function generateWeeklyOffs(
             weekPlacements,
           );
           if (otherCoverage < needed) {
-            viable = false;
-            break;
+            // Check if an available backup exists on this date
+            const backupAssignments = assignments.filter(
+              (a) =>
+                a.processId === proc.id &&
+                a.role === 'BACKUP' &&
+                a.employeeId !== emp.id,
+            );
+            const availableBackup = backupAssignments.find((ba) => {
+              const bStatus = statusMap.get(`${ba.employeeId}|${date}`);
+              if (bStatus !== 'WORKING') return false;
+              if (weekPlacements.get(ba.employeeId) === date) return false;
+              return true;
+            });
+            if (!availableBackup) {
+              viable = false;
+              break;
+            }
           }
         }
 
@@ -217,13 +232,32 @@ export function generateWeeklyOffs(
     const MAX_ATTEMPTS = 100;
     let i = 0;
 
-    while (i < ewItems.length && attempts < MAX_ATTEMPTS) {
+    while (i < ewItems.length) {
       const ew = ewItems[i];
 
       // Recompute candidates (placements may have changed)
       ew.candidates = computeCandidates(ew);
 
       if (ew.candidates.length === 0) {
+        // If this is a partial week at month boundary (< 7 days), the employee's weekly off
+        // falls on the days outside this month (e.g. Sunday falling on Jan 1-3).
+        if (ew.weekDates.length < 7) {
+          i++;
+          continue;
+        }
+
+        const currentEmp = employees.find((e) => e.id === ew.employeeId)!;
+        // If employee has a rest day via a holiday in this week (e.g. Sunday holiday Dec 20)
+        const hasCoincidingHoliday = ew.weekDates.some(
+          (d) =>
+            (currentEmp.preferredOffDay === null || getDayOfWeek(d) === currentEmp.preferredOffDay) &&
+            statusMap.get(`${currentEmp.id}|${d}`) === 'HOLIDAY',
+        );
+        if (hasCoincidingHoliday) {
+          i++;
+          continue;
+        }
+
         // Check if the employee already has a non-WORKING day this week
         // (all leave/holiday/comp-off) — they might not need a weekly off
         const workingDays = ew.weekDates.filter(
@@ -237,7 +271,7 @@ export function generateWeeklyOffs(
           continue;
         }
 
-        // Backtrack: undo last 2 placements and try alternates
+        // Backtrack: undo last 2 placements and try alternates if within attempt budget
         if (assignmentOrder.length >= 1 && attempts < MAX_ATTEMPTS) {
           attempts++;
           const toUndo = Math.min(2, assignmentOrder.length);
@@ -246,85 +280,27 @@ export function generateWeeklyOffs(
             const undoneEw = ewItems[undoIdx];
             weekPlacements.delete(undoneEw.employeeId);
             undoneEw.assignedOff = null;
-            // Move i back to retry from the earliest undone
             i = Math.min(i, undoIdx);
           }
           continue;
         }
 
-        // Exhausted backtracking — try backup or flag conflict
+        // Exhausted candidates & backtracking — flag NO_VALID_WEEKLY_OFF
         const emp = employees.find((e) => e.id === ew.employeeId)!;
-        const empPrimaryAssignments = primaryAssignments.get(emp.id) ?? [];
+        const empPrimaries = primaryAssignments.get(emp.id) ?? [];
+        const firstProc = empPrimaries[0]
+          ? processes.find((p) => p.id === empPrimaries[0].processId)
+          : undefined;
 
-        let resolvedWithBackup = false;
-
-        // Try each working day — find if a backup can cover the blocking process
-        for (const date of ew.weekDates) {
-          const dayStatus = statusMap.get(`${emp.id}|${date}`);
-          if (dayStatus !== 'WORKING') continue;
-
-          // Find the blocking process(es) on this date
-          let allBlockingResolved = true;
-          const backupsNeeded: Allocation[] = [];
-
-          for (const assignment of empPrimaryAssignments) {
-            const proc = processes.find((p) => p.id === assignment.processId)!;
-            if (!isProcessRequired(proc, date, holidays)) continue;
-
-            const needed = getMinStaff(proc, date);
-            const otherCoverage = countOtherPrimaryCoverage(proc.id, date, emp.id, weekPlacements);
-
-            if (otherCoverage < needed) {
-              // Check if a backup exists for this process on this date
-              const backupAssignments = assignments.filter(
-                (a) =>
-                  a.processId === proc.id &&
-                  a.role === 'BACKUP' &&
-                  a.employeeId !== emp.id,
-              );
-
-              const availableBackup = backupAssignments.find((ba) => {
-                const backupEmp = employees.find((e) => e.id === ba.employeeId)!;
-                const backupStatus = statusMap.get(`${ba.employeeId}|${date}`);
-                if (backupStatus !== 'WORKING') return false;
-                if (weekPlacements.get(ba.employeeId) === date) return false;
-                return true;
-              });
-
-              if (availableBackup) {
-                backupsNeeded.push({
-                  employeeId: availableBackup.employeeId,
-                  processId: proc.id,
-                  date,
-                  approved: false,
-                });
-              } else {
-                allBlockingResolved = false;
-              }
-            }
-          }
-
-          if (allBlockingResolved && backupsNeeded.length > 0) {
-            // Use this day with backup allocations
-            ew.assignedOff = date;
-            weekPlacements.set(emp.id, date);
-            assignmentOrder.push(i);
-            proposedBackupAllocations.push(...backupsNeeded);
-            resolvedWithBackup = true;
-            break;
-          }
-        }
-
-        if (!resolvedWithBackup) {
-          // NO_VALID_WEEKLY_OFF
-          conflicts.push({
-            code: 'NO_VALID_WEEKLY_OFF',
-            severity: 'error',
-            date: ew.weekDates[0],
-            employeeId: emp.id,
-            message: `Cannot assign a weekly off for ${emp.name} in week starting ${ew.weekDates[0]}. No candidate day keeps all processes covered, and no backup is available.`,
-          });
-        }
+        conflicts.push({
+          code: 'NO_VALID_WEEKLY_OFF',
+          severity: 'error',
+          date: ew.weekDates[0],
+          employeeId: emp.id,
+          processId: firstProc?.id,
+          brandId: firstProc?.brandId,
+          message: `Cannot assign a weekly off for ${emp.name} in week starting ${ew.weekDates[0]}. No candidate day keeps all processes covered, and no backup is available.`,
+        });
 
         i++;
         continue;
@@ -343,7 +319,6 @@ export function generateWeeklyOffs(
         chosen = preferredCandidate;
       } else {
         // Pick the candidate that keeps the most slack
-        // Slack = sum across all employee's processes of (otherCoverage - needed)
         const empPrimaryAssignments = primaryAssignments.get(emp.id) ?? [];
         let bestSlack = -Infinity;
         chosen = ew.candidates[0];
@@ -367,6 +342,41 @@ export function generateWeeklyOffs(
       ew.assignedOff = chosen;
       weekPlacements.set(emp.id, chosen);
       assignmentOrder.push(i);
+
+      // Check if this placement requires backup allocations
+      const empPrimaryAssignments = primaryAssignments.get(emp.id) ?? [];
+      for (const assignment of empPrimaryAssignments) {
+        const proc = processes.find((p) => p.id === assignment.processId)!;
+        if (!isProcessRequired(proc, chosen, holidays)) continue;
+
+        const needed = getMinStaff(proc, chosen);
+        const otherCoverage = countOtherPrimaryCoverage(proc.id, chosen, emp.id, weekPlacements);
+
+        if (otherCoverage < needed) {
+          const backupAssignments = assignments.filter(
+            (a) =>
+              a.processId === proc.id &&
+              a.role === 'BACKUP' &&
+              a.employeeId !== emp.id,
+          );
+          const availableBackup = backupAssignments.find((ba) => {
+            const bStatus = statusMap.get(`${ba.employeeId}|${chosen}`);
+            if (bStatus !== 'WORKING') return false;
+            if (weekPlacements.get(ba.employeeId) === chosen) return false;
+            return true;
+          });
+
+          if (availableBackup) {
+            proposedBackupAllocations.push({
+              employeeId: availableBackup.employeeId,
+              processId: proc.id,
+              date: chosen,
+              approved: false,
+            });
+          }
+        }
+      }
+
       i++;
     }
 

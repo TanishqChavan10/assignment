@@ -71,7 +71,7 @@ cp .env.example .env.local
    - 30 Processes with custom weekend overrides
    - 35 Process Assignments
    - 4 Holidays (ALL-company, pod-specific, and weekend-coinciding)
-   - 6 Seed Leaves (with duplicate deduplication verification)
+   - 6 Initial Leaves (with duplicate deduplication verification)
 
 ### Running Tests & Dev Server
 ```bash
