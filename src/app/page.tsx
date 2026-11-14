@@ -279,14 +279,74 @@ export default function RosterPage() {
     }
   };
 
-  const errors = useMemo(() => conflicts.filter((c) => c.severity === 'error'), [conflicts]);
-  const warnings = useMemo(() => conflicts.filter((c) => c.severity === 'warning'), [conflicts]);
+  // Active filter label for UI badges
+  const activeFilterLabel = useMemo(() => {
+    if (view === 'company' || !filterId) return 'All Company';
+    if (view === 'brand') return brands.find(b => b.id === filterId)?.name ?? 'Selected Brand';
+    if (view === 'process') return processes.find(p => p.id === filterId)?.name ?? 'Selected Process';
+    if (view === 'employee') return employees.find(e => e.id === filterId)?.name ?? 'Selected Employee';
+    if (view === 'pod') return pods.find(p => p.id === filterId)?.name ?? 'Selected Pod';
+    return '';
+  }, [view, filterId, brands, processes, employees, pods]);
+
+  // Toggle for scoping conflicts to active perspective
+  const [filterConflictsByView, setFilterConflictsByView] = useState(true);
+
+  // Scope conflicts to the active view perspective
+  const viewScopedConflicts = useMemo(() => {
+    if (!filterConflictsByView || view === 'company' || !filterId) {
+      return conflicts;
+    }
+
+    if (view === 'brand') {
+      const brandProcessIds = new Set(
+        processes.filter((p) => p.brand_id === filterId).map((p) => p.id)
+      );
+      const brandEmployeeIds = new Set(
+        assignments.filter((a) => brandProcessIds.has(a.process_id)).map((a) => a.employee_id)
+      );
+
+      return conflicts.filter((c) => {
+        if (c.brandId === filterId) return true;
+        if (c.processId && brandProcessIds.has(c.processId)) return true;
+        if (c.employeeId && brandEmployeeIds.has(c.employeeId)) return true;
+        return false;
+      });
+    }
+
+    if (view === 'process') {
+      const processEmployeeIds = new Set(
+        assignments.filter((a) => a.process_id === filterId).map((a) => a.employee_id)
+      );
+      return conflicts.filter((c) => {
+        if (c.processId === filterId) return true;
+        if (c.employeeId && processEmployeeIds.has(c.employeeId)) return true;
+        return false;
+      });
+    }
+
+    if (view === 'employee') {
+      return conflicts.filter((c) => c.employeeId === filterId);
+    }
+
+    if (view === 'pod') {
+      const podEmployeeIds = new Set(
+        employees.filter((e) => e.pod_id === filterId).map((e) => e.id)
+      );
+      return conflicts.filter((c) => c.employeeId && podEmployeeIds.has(c.employeeId));
+    }
+
+    return conflicts;
+  }, [conflicts, filterConflictsByView, view, filterId, processes, assignments, employees]);
+
+  const errors = useMemo(() => viewScopedConflicts.filter((c) => c.severity === 'error'), [viewScopedConflicts]);
+  const warnings = useMemo(() => viewScopedConflicts.filter((c) => c.severity === 'warning'), [viewScopedConflicts]);
 
   const filteredConflicts = useMemo(() => {
     if (conflictTab === 'errors') return errors;
     if (conflictTab === 'warnings') return warnings;
-    return conflicts;
-  }, [conflictTab, conflicts, errors, warnings]);
+    return viewScopedConflicts;
+  }, [conflictTab, viewScopedConflicts, errors, warnings]);
 
   const totalPages = Math.max(1, Math.ceil(filteredConflicts.length / pageSize));
   const paginatedConflicts = filteredConflicts.slice((conflictPage - 1) * pageSize, conflictPage * pageSize);
@@ -358,7 +418,7 @@ export default function RosterPage() {
                   onChange={(e) => { setView(e.target.value); setFilterId(''); }}
                   className="h-9 px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-sm text-slate-800 font-medium shadow-2xs focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
                 >
-                  <option value="company">All Company (34 Staff)</option>
+                  <option value="company">All Company ({employees.length} Staff)</option>
                   <option value="pod">By Pod</option>
                   <option value="brand">By Brand</option>
                   <option value="process">By Process</option>
@@ -566,7 +626,7 @@ export default function RosterPage() {
                       <td className="sticky left-0 z-10 bg-slate-100 px-4 py-2.5 border-r border-slate-200 text-xs font-bold text-slate-800 shadow-xs">
                         <div className="flex items-center justify-between gap-1">
                           <span className="truncate">Overall Coverage Health</span>
-                          <span className="text-[10px] font-normal text-slate-500 whitespace-nowrap">25 Brands</span>
+                          <span className="text-[10px] font-normal text-slate-500 whitespace-nowrap">{brands.length} Brands</span>
                         </div>
                       </td>
                       {dates.map((d) => {
@@ -673,8 +733,13 @@ export default function RosterPage() {
           <div className="bg-white rounded-xl border border-slate-200/80 shadow-xs overflow-hidden">
             <div className="px-5 py-4 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/50">
               <div>
-                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2 flex-wrap">
                   <span>Engine Conflicts & Alerts</span>
+                  {filterConflictsByView && view !== 'company' && filterId && (
+                    <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-100 text-indigo-800 border border-indigo-200">
+                      Scoped to {activeFilterLabel}
+                    </span>
+                  )}
                   <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-rose-100 text-rose-700">
                     {errors.length} Errors
                   </span>
@@ -684,7 +749,17 @@ export default function RosterPage() {
                     </span>
                   )}
                 </h3>
-                <p className="text-xs text-slate-500 mt-0.5">Errors block final schedule release. Warnings notify pending approvals. Click any alert to view.</p>
+                <div className="flex items-center gap-2 mt-0.5 text-xs text-slate-500 flex-wrap">
+                  <span>Errors block final schedule release. Warnings notify pending approvals.</span>
+                  {view !== 'company' && filterId && (
+                    <button
+                      onClick={() => setFilterConflictsByView(!filterConflictsByView)}
+                      className="text-indigo-600 hover:text-indigo-800 font-semibold underline transition-colors ml-1"
+                    >
+                      {filterConflictsByView ? `View all company alerts (${conflicts.length})` : `Filter to ${activeFilterLabel}`}
+                    </button>
+                  )}
+                </div>
               </div>
 
               <div className="flex items-center gap-2 flex-wrap">
@@ -719,7 +794,7 @@ export default function RosterPage() {
                     onClick={() => { setConflictTab('all'); setConflictPage(1); }}
                     className={`px-3 py-1 rounded-md transition-all ${conflictTab === 'all' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'}`}
                   >
-                    All ({conflicts.length})
+                    All ({viewScopedConflicts.length})
                   </button>
                   <button
                     onClick={() => { setConflictTab('errors'); setConflictPage(1); }}
@@ -739,14 +814,33 @@ export default function RosterPage() {
 
             {/* List */}
             <div className="divide-y divide-slate-100 max-h-[380px] overflow-y-auto">
-              {paginatedConflicts.map((c, i) => {
-                const isError = c.severity === 'error';
-                return (
-                  <div
-                    key={i}
-                    onClick={() => handleConflictClick(c)}
-                    className="p-4 flex items-start justify-between gap-4 hover:bg-slate-50/80 transition-colors cursor-pointer group"
-                  >
+              {paginatedConflicts.length === 0 ? (
+                <div className="text-center py-10 px-4 text-slate-400 text-xs flex flex-col items-center justify-center gap-2">
+                  <div className="w-9 h-9 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center border border-emerald-200">
+                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                    </svg>
+                  </div>
+                  <span className="font-bold text-slate-700 text-sm">No conflicts found for {activeFilterLabel}</span>
+                  <span className="text-slate-400">All shifts, weekly-offs, and process coverage requirements are fully satisfied.</span>
+                  {filterConflictsByView && view !== 'company' && filterId && (
+                    <button
+                      onClick={() => setFilterConflictsByView(false)}
+                      className="mt-1 text-indigo-600 hover:text-indigo-800 font-semibold underline text-xs"
+                    >
+                      View all company alerts ({conflicts.length})
+                    </button>
+                  )}
+                </div>
+              ) : (
+                paginatedConflicts.map((c, i) => {
+                  const isError = c.severity === 'error';
+                  return (
+                    <div
+                      key={i}
+                      onClick={() => handleConflictClick(c)}
+                      className="p-4 flex items-start justify-between gap-4 hover:bg-slate-50/80 transition-colors cursor-pointer group"
+                    >
                     <div className="flex items-start gap-3">
                       <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 mt-0.5 ${isError ? 'bg-rose-50 text-rose-600 border border-rose-200' : 'bg-amber-50 text-amber-600 border border-amber-200'}`}>
                         {isError ? (
@@ -802,7 +896,7 @@ export default function RosterPage() {
                     </div>
                   </div>
                 );
-              })}
+              }))}
             </div>
 
             {/* Pagination */}

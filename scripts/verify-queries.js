@@ -111,10 +111,10 @@ async function runVerification() {
   const { count: brandCount } = await supabase.from('brands').select('*', { count: 'exact', head: true });
   const { count: holidayCount } = await supabase.from('holidays').select('*', { count: 'exact', head: true });
   const { count: leaveCount } = await supabase.from('leaves').select('*', { count: 'exact', head: true });
-  console.log(`  Employees: ${empCount} (Expect 34)`);
-  console.log(`  Brands: ${brandCount} (Expect 25)`);
+  console.log(`  Employees: ${empCount} (Expect 8)`);
+  console.log(`  Brands: ${brandCount} (Expect 5)`);
   console.log(`  Holidays: ${holidayCount} (Expect 4)`);
-  console.log(`  Leaves: ${leaveCount} (Expect 6)`);
+  console.log(`  Leaves: ${leaveCount} (Expect 2)`);
   console.log('====================================================\n');
 }
 

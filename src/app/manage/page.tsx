@@ -18,17 +18,13 @@ export default function ManagePage() {
 
   const loadLists = async () => {
     try {
-      const [p, e, b, pr] = await Promise.all([
-        fetch('/api/roster?month=2026-12&view=company').then((r) => r.json()),
+      const [podsData, e, b, pr] = await Promise.all([
+        fetch('/api/pods').then((r) => r.json()),
         fetch('/api/employees').then((r) => r.json()),
         fetch('/api/brands').then((r) => r.json()),
         fetch('/api/processes').then((r) => r.json()),
       ]);
-      const podMap = new Map<string, string>();
-      (p.employees ?? []).forEach((emp: any) => {
-        if (emp.pods) podMap.set(emp.pods.id, emp.pods.name);
-      });
-      setPods(Array.from(podMap, ([id, name]) => ({ id, name })));
+      setPods(Array.isArray(podsData) ? podsData : []);
       setEmployees(Array.isArray(e) ? e : []);
       setBrands(Array.isArray(b) ? b : []);
       setProcesses(Array.isArray(pr) ? pr : []);
@@ -37,20 +33,29 @@ export default function ManagePage() {
     }
   };
 
-  const loadTab = async () => {
+  const loadTab = async (targetTab: Tab = tab) => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/${tab}`);
+      const res = await fetch(`/api/${targetTab}`);
       const d = await res.json();
       setData(Array.isArray(d) ? d : []);
     } catch {
       setData([]);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
+  };
+
+  const handleTabChange = (newTab: Tab) => {
+    setTab(newTab);
+    setShowForm(false);
+    setSearchQuery('');
+    setData([]);
+    loadTab(newTab);
   };
 
   useEffect(() => { loadLists(); }, []);
-  useEffect(() => { loadTab(); }, [tab]);
+  useEffect(() => { loadTab(tab); }, [tab]);
 
   // Form State
   const [showForm, setShowForm] = useState(false);
@@ -143,7 +148,7 @@ export default function ManagePage() {
             return (
               <button
                 key={t}
-                onClick={() => { setTab(t); setShowForm(false); }}
+                onClick={() => handleTabChange(t)}
                 className={`px-3.5 py-2 rounded-lg text-xs font-semibold transition-all ${
                   isActive
                     ? 'bg-indigo-600 text-white shadow-xs'
@@ -578,11 +583,13 @@ export default function ManagePage() {
                       )}
                       {tab === 'leaves' && (
                         <>
-                          <td className="px-5 py-3 font-semibold text-slate-800">{row.employees?.name ?? row.employee_id}</td>
+                          <td className="px-5 py-3 font-semibold text-slate-800">
+                            {row.employees?.name ?? employees.find((e) => e.id === row.employee_id)?.name ?? row.employee_id}
+                          </td>
                           <td className="px-5 py-3 font-mono text-slate-700 font-semibold">{row.date}</td>
                           <td className="px-5 py-3">
                             <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${row.type === 'LEAVE' ? 'bg-rose-50 text-rose-700 border-rose-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
-                              {row.type}
+                              {row.type ?? 'LEAVE'}
                             </span>
                           </td>
                           <td className="px-5 py-3 text-right">

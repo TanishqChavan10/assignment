@@ -105,136 +105,129 @@ npm run dev
 
 ---
 
-## 5. Tell Us How You Think (The 8 Questions)
+## 5. Architectural & Design Decisions (Answering the 8 Core Questions)
 
-### 1. Modeling
-**How did you model pods, brands, processes, calendars, employees, assignments, leaves, and the roster? What are the key entities and relationships?**
+### 1. How did you model employees, brands, processes, pods, and their relationships?
 
-- **`Pod`**: Organizational grouping containing a `leadEmployeeId`.
-- **`Employee`**: Belongs to one Pod, has a `dailyCapacity` (default 1.00), and an optional `preferredOffDay` (0–6).
-- **`Brand` & `Process`**: Brands own one or more Processes (e.g. CS, ACC, NDR). Each Process defines its `calendarRule` (`ALL_DAYS_365`, `ALL_EXCEPT_HOLIDAYS`, `EXCEPT_SUNDAYS_AND_HOLIDAYS`), baseline `minStaff`, and a `minStaffOverrides` JSONB map for weekday-specific rules (e.g. `{"0": 2, "6": 2}` for weekend surges).
-- **`Assignment`**: Links an Employee to a Process with a designated `role` (`PRIMARY` or `BACKUP`) and workload `weight` (e.g. 0.5 for split focus, 1.0 for full-time).
-- **`Holiday` & `Leave`**: Holidays are scoped either globally or to selected pods. Leaves are unique on `(employeeId, date, type)`, natively preventing double-counting.
-- **`RosterEntry` vs. `Allocation`**: `RosterEntry` stores human work states (`WORKING`, `WEEKLY_OFF`, `HOLIDAY`, `LEAVE`, `COMP_OFF`). `Allocation` stores process coverage `(employeeId, processId, date, approved)`. This separation ensures business coverage checks remain completely decoupled from personal work status.
+The domain model enforces a strict separation between **operational requirements** (when a business process must run) and **human availability** (when an individual is working or resting):
 
----
-
-### 2. Generation and Constraint Checking
-**How does your scheduling engine work? Walk through the steps from inputs to the final roster.**
-
-1. **Step 1 (Requirements Calculation)**: Computes whether coverage is required for every process and date based on its calendar rule and holiday overlaps, applying weekday `minStaff` overrides.
-2. **Step 2 (Employee Availability)**: Flags employee availability by checking leaves, comp-offs, and pod-specific holidays.
-3. **Step 3 (Weekly-Off Assignment with Backtracking)**:
-   - Evaluates candidate off-days for each employee-week where all their primary processes retain sufficient alternative primary coverage.
-   - Sorts employee-weeks **most-constrained-first** (fewest valid candidates).
-   - Attempts placement prioritizing `preferredOffDay`, falling back to the day that preserves the most system-wide staffing slack.
-   - If an employee hits 0 valid candidates, the engine performs chronological backtracking (undoing up to the last 2 placements and trying alternate branches, capped at 100 iterations).
-   - If still unresolvable, it evaluates eligible backups to propose an unapproved backup allocation; otherwise, it records a deterministic `NO_VALID_WEEKLY_OFF` conflict without crashing.
-4. **Step 4 (Allocation Generation)**: Maps working employees to their required primary processes, accumulates daily weights, detects over-capacity conditions (`OVERLOAD`), and awards comp-off credits for holiday work on 365-day brands.
-5. **Step 5 (Validation)**: Validates approved allocations against process minimums to flag `NO_COVERAGE`, `UNDERSTAFFED`, `OVERLOAD`, `PROCESS_UNASSIGNED`, and `BACKUP_PENDING`.
+- **`Pod`**: Organizational group with a designated `leadEmployeeId`.
+- **`Employee`**: Belongs to a Pod, with a finite `dailyCapacity` (default `1.00`) and an optional `preferredOffDay` (0 = Sun, 1 = Mon ... 6 = Sat).
+- **`Brand` & `Process`**: Brands own one or more Processes (e.g. CS, ACC, NDR). Each Process defines its `calendarRule` (`ALL_DAYS_365`, `ALL_EXCEPT_HOLIDAYS`, `EXCEPT_SUNDAYS_AND_HOLIDAYS`), baseline `minStaff`, and a `minStaffOverrides` map for weekday-specific demand (e.g. weekend surges).
+- **`Assignment`**: Connects an Employee to a Process with a `role` (`PRIMARY` or `BACKUP`) and workload `weight` (e.g. 0.5 for split focus, 1.0 for full-time).
+- **`Holiday` & `Leave`**: Holidays are scoped globally (`ALL`) or to specific pods. Leaves are recorded per employee and date, deduplicated natively.
+- **`RosterEntry` vs. `Allocation`**: 
+  - `RosterEntry` tracks human status: `WORKING`, `WEEKLY_OFF`, `HOLIDAY`, `LEAVE`, `COMP_OFF`.
+  - `Allocation` tracks process coverage: `(employeeId, processId, date, approved)`.
+  *Key principle: Coverage is verified strictly against approved allocations, never raw employee statuses.*
 
 ---
 
-### 3. Single vs. Multi-Employee Brands
-**How did you handle the difference between single-employee and multi-employee brands?**
+### 2. How does your system generate a roster and determine whether it satisfies the required constraints?
 
-- **Multi-Employee Brands**: Provide natural redundancy. When Employee A takes their weekly off or leave, the candidate evaluator verifies that the remaining primary employees meet `minStaff`. The system dynamically balances off-days across the week so that both workers are not off simultaneously.
-- **Single-Employee Brands**: Have zero native slack. For non-365 processes (e.g., Sunday-off or holiday-off), weekly offs naturally slot into those closed days. For `ALL_DAYS_365` single-employee brands, the algorithm identifies that the primary employee cannot take any day off without violating coverage. It specifically looks for a designated `BACKUP` assignment. If a backup exists (e.g., Glowvia), it places the off-day and generates an unapproved backup allocation (`BACKUP_PENDING`). If no backup exists (e.g., the deliberate Spectra scenario), it halts greedy placement and records an explicit `NO_VALID_WEEKLY_OFF` error.
+The roster generation pipeline runs as a pure, deterministic TypeScript engine in 5 steps:
 
----
-
-### 4. Sole Employee Unavailable
-**What happens when the sole assigned employee for a brand goes on leave or has a weekly off? How does your system respond?**
-
-1. If scheduled for a **weekly off**: The generator searches for an available employee assigned as `BACKUP` for that process who has remaining capacity. It slots the off-day and creates an allocation flagged with `approved = false`.
-2. If the manager **adds an unscheduled leave**:
-   - The cell update saves the leave.
-   - The engine runs **revalidation only** (preserving the existing schedule).
-   - The process immediately turns **red** on the coverage row and logs a `NO_COVERAGE` error in the conflicts panel.
-   - Clicking **"Suggest"** activates `suggestReplacements()`, which filters all assigned backups, verifies they are not on leave/holiday/weekly off on that date, ensures they have available capacity, and ranks them (same pod first → lowest monthly workload).
-   - Clicking **"Approve"** creates an approved allocation, immediately clearing the conflict without full roster regeneration.
+1. **Requirements Calculation**: Computes whether each process is required on each calendar day based on its `calendarRule`, holiday schedules, and weekday minimum staffing overrides.
+2. **Employee Availability**: Marks non-working dates from approved leaves, comp-offs, and applicable pod holidays.
+3. **Weekly-Off Heuristic Placement with Backtracking**:
+   - Divides the month into ISO weeks (Mon–Sun). Partial boundary weeks only get an off day if they have ≥ 4 days in the month.
+   - Computes candidate off days for each employee-week where remaining assigned primary staff satisfy process minimums.
+   - Evaluates employee-weeks **most-constrained-first** (fewest valid candidate days).
+   - Attempts placement matching `preferredOffDay`, falling back to days with the greatest system staffing slack.
+   - If an employee hits zero valid options, the engine backtracks up to 2 prior placements. If still unresolvable, it searches for eligible backups to propose an unapproved allocation (`BACKUP_PENDING`), or logs an explicit `NO_VALID_WEEKLY_OFF` error.
+4. **Allocation Generation**: Maps working employees to their required processes, checks daily capacity limits (flagging `OVERLOAD` if exceeded), and credits comp-offs for holiday workers on 365-day brands.
+5. **Validation**: Compares approved allocations against process minimums, raising blocking errors (`NO_COVERAGE`, `UNDERSTAFFED`, `OVERLOAD`, `NO_VALID_WEEKLY_OFF`, `PROCESS_UNASSIGNED`) or warnings (`BACKUP_PENDING`).
 
 ---
 
-### 5. Conflicts and Insufficient Staffing
-**How do you detect, surface, and handle conflicts? What can a manager do when there aren't enough people to cover?**
+### 3. How did you handle the difference between single-resource brands and brands with multiple employees?
 
-- **Detection**: The validator inspects every required process-date pair, comparing approved allocations against required minimums, checking capacity ceilings, and tracking assignment integrity.
-- **Surfacing**:
-  - **Color-Coded Coverage Row**: Green (fully covered), Red (uncovered/understaffed), Amber (coverage contingent on pending backup approval).
-  - **Conflicts Panel**: Categorized into **Errors** (blocking publish: `NO_COVERAGE`, `UNDERSTAFFED`, `OVERLOAD`, `NO_VALID_WEEKLY_OFF`, `PROCESS_UNASSIGNED`) and **Warnings** (non-blocking: `BACKUP_PENDING`, `PREFERENCE_VIOLATED`).
-- **Manager Actions**:
-  - One-click approval of pending backups.
-  - Reviewing ranked suggestions for emergency coverage.
-  - Modifying assignments or overriding statuses directly in the editable matrix.
-  - Using `/manage` to assign secondary personnel or adjust minimum staffing parameters.
+- **Brands with Multiple Employees** (e.g., LuxeCore): Provide inherent redundancy. The candidate evaluator checks that when one worker takes their weekly off or leave, the remaining primary workers satisfy `minStaff`. Off days are staggered across the week to prevent simultaneous absences.
+- **Single-Resource Brands** (e.g., Glowvia, Spectra): Zero native redundancy.
+  - On non-365 calendars (e.g. MoonLight on `EXCEPT_SUNDAYS_AND_HOLIDAYS`), the weekly off naturally slots into scheduled closed days (Sundays).
+  - On `ALL_DAYS_365` calendars, an employee cannot take any day off without creating a coverage void. The engine looks for a designated `BACKUP` assignment:
+    - If a backup exists (e.g. **Glowvia**, with Kavya as backup for Arjun), it assigns the off day and generates a `BACKUP_PENDING` warning awaiting manager approval.
+    - If **no backup exists** (e.g. **Spectra**, with Rahul only), the engine refuses to invent phantom staff and raises a deterministic `NO_VALID_WEEKLY_OFF` blocking error.
 
 ---
 
-### 6. Automated vs. Human
-**What did you automate, and what did you leave for the human ops manager to decide? Why?**
+### 4. What happens when an employee manages all processes for a brand but is unavailable on a required working day?
+
+When a sole worker becomes unavailable (e.g. Arjun takes leave on a working Sunday for Glowvia):
+1. **Targeted Revalidation**: The system does not wipe or re-randomize the monthly roster. It saves the leave, sets the employee's roster status to `LEAVE`, removes their allocations for that date, and revalidates.
+2. **Visual Surfacing**: The brand's process coverage row turns **red** on that date, and a blocking `NO_COVERAGE` error appears in the conflicts panel.
+3. **Smart Replacement Engine (`suggestReplacements`)**:
+   - Filters all staff assigned as `BACKUP` for that process.
+   - Verifies the backup is available (not on leave, holiday, or off) and has spare daily capacity.
+   - Ranks candidates: **Same Pod first** (to minimize cross-pod coordination overhead) → **Lowest monthly workload** (to balance shift equity).
+4. **Manager-in-the-Loop Resolution**: The manager clicks "Approve & Slot", creating an approved allocation that immediately turns the cell green and clears the error.
+
+---
+
+### 5. How does your system handle conflicting requirements or insufficient staffing?
+
+- **Detection**: Every required process-date pair is validated against approved staff count and capacity ceilings.
+- **Categorization**:
+  - **Blocking Errors** (prevent roster publication): `NO_COVERAGE` (0 staff), `UNDERSTAFFED` (< minStaff), `OVERLOAD` (allocated weight > capacity), `NO_VALID_WEEKLY_OFF` (unsolvable off-day), `PROCESS_UNASSIGNED`.
+  - **Warnings** (operational notices): `BACKUP_PENDING` (proposed backup awaiting approval), `PREFERENCE_VIOLATED` (off-day placed away from preference).
+- **Manager Resolution Tools**:
+  - One-click **Approve All Pending** to batch-authorize proposed backups.
+  - One-click **Find Replacement** modal with ranked, capacity-checked candidates.
+  - Direct matrix inline editing with real-time constraint revalidation.
+  - Master data updates via `/manage` to assign floaters or adjust staffing rules.
+
+---
+
+### 6. Which parts of the process did you automate, and which did you leave under human control? Why?
 
 - **Automated**:
-  - Calculation of requirements from calendar rules, holidays, and overrides.
-  - Placement of weekly offs using constraint-satisfaction heuristics and backtracking.
-  - Detection and classification of all 7 conflict types.
-  - Ranking and filtering of replacement candidates based on pod alignment and workload fairness.
-  - Automatic calculation and logging of comp-off credits earned on holidays.
-- **Human Ops Manager Decisions**:
-  - **Approval of Backups**: Backups intentionally require human confirmation because pulling an employee from one pod/brand to another has operational trade-offs that software should not commit autonomously.
-  - **Resolving Impossible Constraints**: Situations like single-resource 365-day brands with no backup (`Spectra`) surface as explicit errors rather than having the engine invent non-existent staff.
-  - **Comp-Off Date Redemption**: When earned comp-offs are redeemed is left to manager-employee agreement.
+  - Calculation of daily requirements across complex calendar rules and holiday overlaps.
+  - Constraint satisfaction and backtracking heuristics for weekly off distribution.
+  - Conflict detection and classification across all 7 operational rules.
+  - Replacement candidate filtering, eligibility verification, and ranking.
+  - Automatic comp-off credit accrual for holiday shifts on 365-day brands.
+- **Left Under Human Control**:
+  - **Backup Shift Authorization**: Backups require explicit manager approval because moving an employee across brands or pods involves contextual trade-offs software cannot anticipate.
+  - **Unsolvable Deadlocks**: When a brand is fundamentally understaffed (like Spectra), the system surfaces the gap clearly rather than making unsafe assumptions.
+  - **Comp-Off Date Redemption**: When an earned comp-off is taken is agreed between employee and manager.
 
 ---
 
-### 7. Doubling Scale
-**If the team doubled to 70 employees and 50 brands tomorrow, what would break first? How would you adapt your design?**
+### 7. If the company doubled its team and brand count, what would you change about your solution?
 
-- **What breaks first**:
-  - In-memory backtracking for weekly-off assignment could hit recursion/attempt ceilings if cross-brand constraints grow densely interconnected.
-  - Client-side full-month matrix rendering would experience DOM bloat (70 rows × 31 columns = 2,170 interactive cells).
-  - Loading the entire database state into memory for every validation call would introduce network and memory overhead.
-- **Architectural Adaptations**:
-  - **Engine**: Replace heuristic backtracking with an industrial constraint programming solver (e.g. Google OR-Tools CP-SAT or an integer programming solver) running asynchronously in background workers.
-  - **Database**: Add composite indexing on `(date, process_id, approved)` and partition roster entries by month/year.
-  - **Incremental Validation**: Perform localized validation scoped to the affected pod or process group rather than recalculating the entire company month.
-  - **UI**: Virtualize the table rows (e.g., via `@tanstack/react-virtual`) to render only visible viewport elements.
+If scaled to 70+ employees and 50+ brands:
+1. **Engine Solver**: Transition from in-memory recursive backtracking to an asynchronous constraint programming solver (e.g. Google OR-Tools CP-SAT) running in background workers to handle dense cross-brand constraints.
+2. **Database Optimization**: Add composite indices on `(date, process_id, approved)` and partition `roster_entries` and `allocations` by month/year.
+3. **Scoped / Incremental Validation**: Validate at the pod or process cluster level instead of re-evaluating the entire company month on every single cell edit.
+4. **Matrix Virtualization**: Use windowed rendering (e.g. `@tanstack/react-virtual`) so only visible grid rows and columns are rendered in the DOM.
 
 ---
 
-### 8. One More Week
-**If you had one more week to work on this, what would you add or improve?**
+### 8. If you had one additional week to work on this, what would you improve first?
 
-1. **Shift Timings & Intra-Day Hours**: Expand the day-level abstraction to support multi-shift operations (e.g. Morning, Afternoon, Night, Weekend On-Call) with minimum rest-period constraints between consecutive shifts.
-2. **Workload & Weekend Fairness Optimizer**: Introduce multi-objective scoring to balance weekend shifts evenly across employees over rolling 90-day windows.
-3. **Formal Approval & Request Workflows**: An employee portal for requesting leaves and swap requests with automated manager approval queues.
-4. **Audit Logging & Roster Versioning**: Historical snapshot diffing (`v1.0 Published` vs `v1.1 After Leaves`) allowing ops teams to view schedule evolution over time.
-5. **CSV/Excel Export & Webhooks**: One-click export to Google Sheets/Excel and automated Slack/Discord alerts when emergency gaps arise.
+1. **Shift Timings & Intra-Day Hours**: Expand from day-level granularity to multi-shift scheduling (Morning, Afternoon, Night, On-Call) with mandatory rest intervals between consecutive shifts.
+2. **Workload & Weekend Equity Balancer**: Add multi-objective optimization to balance weekend shifts evenly across employees over rolling 90-day cycles.
+3. **Employee Self-Service Portal**: Introduce worker portals for requesting leaves and shift swaps with integrated manager approval queues.
+4. **Audit Trail & Roster Snapshots**: Implement versioning (`v1.0 Published` vs `v1.1 Post-Leave`) with visual diff comparisons for operational auditing.
+5. **Direct Notification Webhooks**: Automated Slack/Teams notifications when emergency coverage gaps arise.
 
 ---
 
-## 6. Demo Video Walkthrough Script (3–5 Minutes)
+## 6. Demo Video Walkthrough Script (3–4 Minutes)
 
-1. **0:00 - 0:30 (Data Management & Setup)**:
-   - Navigate to `/manage`.
-   - Point out the 4 pods, 34 employees, multi-brand split (e.g. Brand A with 3 processes vs. single-employee brands), and the Glowvia demo configuration.
-2. **0:30 - 1:10 (Roster Generation & Grid Overview)**:
-   - Return to `/` and click **"Generate Roster"** for `2026-12`.
-   - Show the generated matrix: color-coded statuses (`W` = Working, `WO` = Weekly Off, `H` = Holiday, `L` = Leave).
-3. **1:10 - 1:50 (Multi-View Filtering & Coverage Rows)**:
-   - Filter by Brand: select `Glowvia` (365-day) vs. a Sunday-off brand.
-   - Switch filter to multi-employee Brand A (`LuxeCore`) and inspect the individual process coverage rows.
-4. **1:50 - 2:30 (Surfacing Conflicts & Deliberate Failures)**:
-   - Highlight the conflicts panel.
-   - Showcase the deliberate unsolvable case (`Spectra`: 365-day brand with 1 employee and no backup) showing `NO_VALID_WEEKLY_OFF`.
-5. **2:30 - 3:30 (Change Handling & Replacement Workflow)**:
-   - Navigate to `/manage` -> **Leaves**, add a leave for Glowvia's primary employee (`Arjun Mehta`) on a working Sunday (`2026-12-06`).
-   - Return to `/`: show the coverage row turning **red** and the new `NO_COVERAGE` error.
-   - Click **"Suggest"**: show the ranked candidates modal displaying the backup (`Kavya Joshi`, same pod, available).
-   - Click **"Approve"**: show the conflict clearing and coverage turning green.
-6. **3:30 - 4:00 (Manual Editing & Test Suite)**:
-   - Click any grid cell to manually edit status and demonstrate instantaneous conflict revalidation.
-   - Switch to the terminal and execute `npm test` to show all 71 unit and integration tests passing.
+1. **0:00 - 0:40 (Domain & Master Data)**:
+   - On `/manage`, show the 8 employees across 2 pods, 5 brands, and process assignments (Glowvia with Arjun & Kavya; Spectra with Rahul only; LuxeCore with 3 processes).
+2. **0:40 - 1:20 (Roster Generation & Weekly Off Heuristics)**:
+   - On `/` for December 2026, click **Generate Roster**. Show the matrix fill, point out Arjun's Wednesdays and Kavya's Tuesdays, and the Overall Coverage Health row.
+3. **1:20 - 2:00 (Decoupled Operating Calendars)**:
+   - Filter by Brand: Show **MoonLight** (Sunday-off, Nisha off on Sunday), **Glowvia** (365-day active coverage across all 31 days), and **LuxeCore** (3 staggered workers across CS, ACC, NDR).
+4. **2:00 - 2:45 (Surfacing Conflicts & Approvals)**:
+   - In Conflicts panel, show **Spectra** `NO_VALID_WEEKLY_OFF` (unsolvable case). Filter to **Glowvia**, show `BACKUP_PENDING` warnings, and click **Approve All Pending** to turn it 100% green.
+5. **2:45 - 3:35 (Unplanned Leave & Smart Replacement)**:
+   - In `/manage`, add Arjun's leave on Sunday Dec 6. Return to `/`: Glowvia Dec 6 turns red (`NO_COVERAGE`).
+   - Click **Find Replacement**: Show **Kavya Joshi ranked #1** (same pod, available, capacity free) and click **Approve & Slot** to restore coverage.
+6. **3:35 - 4:10 (Manual Edits & Engine Tests)**:
+   - Change a cell from `W` to `WO` (instant conflict) and back to `W` (clears). Run `npm test` in the terminal to display all 71 pure TypeScript unit tests passing in ~1s.
 
 ---
 

@@ -20,7 +20,7 @@ export async function GET(req: NextRequest) {
     await Promise.all([
       supabase.from('roster_entries').select('*').gte('date', startDate).lte('date', endDate),
       supabase.from('allocations').select('*').gte('date', startDate).lte('date', endDate),
-      supabase.from('employees').select('*, pods(id, name)').order('name'),
+      supabase.from('employees').select('*, pods:pods!employees_pod_id_fkey(id, name)').order('name'),
       supabase.from('processes').select('*, brands(id, name)').order('name'),
       supabase.from('brands').select('*').order('name'),
       supabase.from('assignments').select('*'),
